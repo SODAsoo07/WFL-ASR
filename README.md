@@ -42,6 +42,66 @@ The encoded features go through a stack of optional, configurable layers:
 - Configurable architecture (BiLSTM, Conformer, Conv)
 - HTK-compatible `.lab` output format
 - Optional waveform augmentation via the `augmentation` config section
+- Optional forced alignment from sidecar `.txt` phone sequences
+- Optional Korean lyrics / g2pK-pronounced Hangul to Coda-SVS Korean phoneme conversion
+- Optional C/V class label export as `*.cv.lab`
+
+---
+
+## Korean Coda-SVS Forced Alignment
+
+`infer.py` can use a sidecar `.txt` file with the same basename as the `.wav` file for forced alignment.
+
+```text
+infer_test/song_001.wav
+infer_test/song_001.txt
+```
+
+Existing phone-token `.txt` files still work:
+
+```text
+s a r a NG h e
+```
+
+Korean lyrics can also be converted to the Coda-SVS Korean phoneme set at inference time:
+
+```bash
+python infer.py -i infer_test --txt-mode coda-korean
+```
+
+This mode uses `g2pK` first, then maps the pronounced Hangul to Coda-style phones such as `g a ch i m eo NG n eu N`.
+
+If the `.txt` is already g2pK-pronounced Hangul, skip g2pK:
+
+```bash
+python infer.py -i infer_test --txt-mode coda-korean-pronounced
+```
+
+For C/V label export:
+
+```bash
+python infer.py -i infer_test --txt-mode coda-korean --save-cv-lab
+```
+
+This writes both:
+
+```text
+song_001.lab     # phone labels
+song_001.cv.lab  # C / V / SP / O labels
+```
+
+Useful options:
+
+```bash
+--txt-mode auto|phones|coda-korean|coda-korean-pronounced
+--keep-spaces-as-sp
+--punctuation-as-sp / --no-punctuation-as-sp
+--save-cv-lab
+--merge-cv-segments
+--save-json
+```
+
+`g2pK` is only required for `--txt-mode coda-korean`. For already-pronounced Hangul, use `--txt-mode coda-korean-pronounced`.
 
 ---
 
