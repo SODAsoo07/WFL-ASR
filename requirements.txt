@@ -9,6 +9,10 @@ transformers==4.51.3
 click
 pytorch-optimizer
 
+# Optional: needed only for `infer.py --txt-mode coda-korean`.
+# Use `--txt-mode coda-korean-pronounced` if the sidecar .txt is already g2pK-pronounced Hangul.
+g2pK
+
 # RECOMMENDED: install torch manually. Environment used: Python 3.11
 #torch==2.6.0+cu124
 #torchaudio==2.6.0+cu124
