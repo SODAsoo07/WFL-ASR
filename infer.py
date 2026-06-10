@@ -6,6 +6,12 @@ import soundfile as sf
 import torchaudio
 import numpy as np
 
+from coda_korean import (
+    contains_hangul,
+    load_coda_korean_txt,
+    phone_segments_to_cv_segments,
+    save_segments_json,
+)
 from model import BIOPhonemeTagger
 from utils import (
     decode_bio_tags,
@@ -41,6 +47,64 @@ def find_matching_txt(wav_path):
     base, _ = os.path.splitext(wav_path)
     txt_path = base + ".txt"
     return txt_path if os.path.isfile(txt_path) else None
+
+
+def load_forced_alignment_phones(
+    txt_path,
+    txt_mode,
+    labels,
+    keep_spaces_as_sp=False,
+    punctuation_as_sp=True,
+    word_sep="SP",
+):
+    """
+    Load forced-alignment tokens from a sidecar .txt file.
+
+    txt_mode:
+      - phones: the .txt already contains model phoneme tokens.
+      - coda-korean: Korean lyrics; run g2pK, then convert to Coda Korean phones.
+      - coda-korean-pronounced: already-pronounced Hangul; skip g2pK, then convert.
+      - auto: Hangul text uses coda-korean, otherwise phones.
+    """
+    if txt_mode == "auto":
+        with open(txt_path, "r", encoding="utf-8") as f:
+            text = f.read()
+        txt_mode = "coda-korean" if contains_hangul(text) else "phones"
+
+    if txt_mode == "phones":
+        phones = load_phones_txt(txt_path)
+    elif txt_mode == "coda-korean":
+        phones = load_coda_korean_txt(
+            txt_path,
+            use_g2pk=True,
+            keep_spaces_as_sp=keep_spaces_as_sp,
+            punctuation_as_sp=punctuation_as_sp,
+            word_sep=word_sep,
+        )
+    elif txt_mode == "coda-korean-pronounced":
+        phones = load_coda_korean_txt(
+            txt_path,
+            use_g2pk=False,
+            keep_spaces_as_sp=keep_spaces_as_sp,
+            punctuation_as_sp=punctuation_as_sp,
+            word_sep=word_sep,
+        )
+    else:
+        raise ValueError(f"Unsupported txt_mode: {txt_mode}")
+
+    if not phones:
+        return [], txt_mode
+
+    label_set = set(labels)
+    missing = [p for p in phones if p not in label_set]
+    if missing:
+        missing_unique = sorted(set(missing))
+        raise ValueError(
+            "Sidecar .txt produced phonemes that are not in phonemes.txt: "
+            + ", ".join(missing_unique)
+        )
+
+    return phones, txt_mode
 
 
 def constrained_decode(logits, id2label):
@@ -111,7 +175,7 @@ def apply_hard_silence(segments, audio, sr, threshold, min_duration, silence_pho
         return segments
 
     temp_segments = segments.copy()
-    
+
     for sil_start, sil_end in silence_intervals:
         next_temp_segments = []
         for s_start, s_end, s_label in temp_segments:
@@ -218,10 +282,10 @@ def process_audio(
     for s, e, ph in all_segments:
         if s >= original_duration:
             continue
-        
+
         if e > original_duration:
             e = original_duration
-        
+
         valid_segments.append((s, e, ph))
 
     if not valid_segments:
@@ -255,11 +319,40 @@ def process_audio(
 @click.option("--config", "-c", default="checkpoints_no_env/config.yaml", help="Path to config file")
 @click.option("--lang-id", "-l", type=int, default=None, help="Language ID (int) used during training. Example: `-l 0`")
 @click.option("--no_use_offset", is_flag=True, help="Disable offset head refinement (offsets ON by default).")
+@click.option(
+    "--txt-mode",
+    type=click.Choice(["auto", "phones", "coda-korean", "coda-korean-pronounced"]),
+    default="auto",
+    show_default=True,
+    help="How to read sidecar .txt files for forced alignment.",
+)
+@click.option("--keep-spaces-as-sp", is_flag=True, help="When converting Korean .txt, keep whitespace as SP tokens.")
+@click.option("--punctuation-as-sp/--no-punctuation-as-sp", default=True, show_default=True, help="When converting Korean .txt, convert punctuation to SP.")
+@click.option("--word-sep", default="SP", show_default=True, help="Silence token emitted for spaces/punctuation in Korean .txt modes.")
+@click.option("--save-cv-lab", is_flag=True, help="Also save a C/V class label file next to the normal .lab output.")
+@click.option("--merge-cv-segments", is_flag=True, help="Merge adjacent equal C/V/SP labels in the .cv.lab output.")
+@click.option("--save-json", is_flag=True, help="Also save a JSON copy of the phone segments.")
 # long silence stuff
 @click.option("--silence-phoneme", default="SP", help="The phoneme label to use for hard-coded silence (default: SP)")
 @click.option("--silence-threshold", default=0.005, type=float, help="Amplitude threshold (0.0-1.0) to consider as silence")
 @click.option("--min-silence-duration", default=0.5, type=float, help="Minimum duration (seconds) required to trigger hard silence")
-def main(input_path, checkpoint, config, lang_id, no_use_offset, silence_phoneme, silence_threshold, min_silence_duration):
+def main(
+    input_path,
+    checkpoint,
+    config,
+    lang_id,
+    no_use_offset,
+    txt_mode,
+    keep_spaces_as_sp,
+    punctuation_as_sp,
+    word_sep,
+    save_cv_lab,
+    merge_cv_segments,
+    save_json,
+    silence_phoneme,
+    silence_threshold,
+    min_silence_duration,
+):
     cfg = load_config(config)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Running on: {device}")
@@ -313,9 +406,19 @@ def main(input_path, checkpoint, config, lang_id, no_use_offset, silence_phoneme
         phones = None
         if txt_path:
             try:
-                phones = load_phones_txt(txt_path)
+                phones, used_txt_mode = load_forced_alignment_phones(
+                    txt_path,
+                    txt_mode,
+                    labels,
+                    keep_spaces_as_sp=keep_spaces_as_sp,
+                    punctuation_as_sp=punctuation_as_sp,
+                    word_sep=word_sep,
+                )
                 if phones:
-                    print(f"  Forced-align enabled (found: {os.path.basename(txt_path)})")
+                    print(
+                        f"  Forced-align enabled ({used_txt_mode}, found: {os.path.basename(txt_path)})"
+                    )
+                    print(f"  Phones: {' '.join(phones)}")
                 else:
                     phones = None
             except Exception as e:
@@ -351,9 +454,9 @@ def main(input_path, checkpoint, config, lang_id, no_use_offset, silence_phoneme
         if cfg.get("postprocess", {}).get("merge_segments", "right") != "none":
             segments = merge_adjacent_segments(segments, cfg["postprocess"]["merge_segments"])
 
-        # Apply hard silence ONLY if we are NOT using forced alignment
-        # Forced alignment already knows where silence is based on the text "SP" tag if its in the txt
-        # adding heuristic silence on top of forced alignment usually breaks things so yea no
+        # Apply hard silence ONLY if we are NOT using forced alignment.
+        # Forced alignment already knows where silence is based on the text SP tag.
+        # Adding heuristic silence on top of forced alignment usually breaks the path.
         if phones is None:
             segments = apply_hard_silence(
                 segments,
@@ -361,12 +464,26 @@ def main(input_path, checkpoint, config, lang_id, no_use_offset, silence_phoneme
                 sr,
                 threshold=silence_threshold,
                 min_duration=min_silence_duration,
-                silence_phoneme=silence_phoneme
+                silence_phoneme=silence_phoneme,
             )
 
         out_path = wav_path.replace(".wav", ".lab")
         save_lab(out_path, segments)
         print(f"Saved -> {out_path}")
+
+        if save_cv_lab:
+            cv_segments = phone_segments_to_cv_segments(
+                segments,
+                merge_adjacent=merge_cv_segments,
+            )
+            cv_out_path = wav_path.replace(".wav", ".cv.lab")
+            save_lab(cv_out_path, cv_segments)
+            print(f"Saved -> {cv_out_path}")
+
+        if save_json:
+            json_out_path = wav_path.replace(".wav", ".json")
+            save_segments_json(json_out_path, segments)
+            print(f"Saved -> {json_out_path}")
 
 
 if __name__ == "__main__":
